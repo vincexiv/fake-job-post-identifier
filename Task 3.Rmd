@@ -1,0 +1,818 @@
+---
+title: "Assignment 3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+options (scipen = 999)
+library(tidyverse)
+library(tidymodels)
+library(tidytext)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)  # - new 
+library(doParallel) # - new 
+library(rpart.plot)
+library(textrecipes)
+library(stringi)
+library(xgboost)
+```
+
+```{r, message=FALSE, error=FALSE}
+job_holdout <- read.csv("job_holdout.csv")
+job_training <- read.csv("job_training.csv")
+
+job_training <- job_training %>% janitor::clean_names()
+```
+
+```{r}
+job_training %>% skimr::skim_without_charts()
+```
+
+
+## Clean data
+
+### Remove unimportant data
+```{r, message=FALSE, warning=FALSE}
+job_training <- job_training %>% select(-location)
+job_holdout <- job_holdout %>% select(-location)
+```
+
+
+
+### Replace variables with their binary variables
+```{r, message=FALSE, warning=FALSE}
+job_training <- job_training %>%
+  mutate(has_salary_range = ifelse(is.na(salary_range), 0, 1))%>%
+  select(-salary_range)
+
+job_holdout <- job_holdout %>%
+  mutate(has_salary_range = ifelse(is.na(salary_range), 0, 1))%>%
+  select(-salary_range)
+
+
+job_training <- job_training %>%
+  mutate(has_department = ifelse(is.na(department), 0, 1)) %>%
+  select(-department)
+
+job_holdout <- job_holdout %>%
+  mutate(has_department = ifelse(is.na(department), 0, 1)) %>%
+  select(-department)
+
+```
+
+
+### Work on the "Not applicables'
+```{r, message=FALSE, warning=FALSE}
+#---
+job_training$employment_type[is.na(job_training$employment_type)] <- "Other"
+job_holdout$employment_type[is.na(job_holdout$employment_type)] <- "Other"
+
+#---
+job_training$required_experience[is.na(job_training$required_experience)] <- "Not Applicable"
+job_holdout$required_experience[is.na(job_holdout$required_experience)] <- "Not Applicable"
+
+#---
+job_training$required_education[is.na(job_training$required_education)] <- "Unspecified"
+job_holdout$required_education[is.na(job_holdout$required_education)] <- "Unspecified"
+
+```
+
+
+### Target encoding
+```{r, message=FALSE, warning=FALSE}
+####---
+industry_fraud <- job_training %>%
+  group_by(fraudulent, industry) %>%
+  select(industry) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from= n, values_fill = 0.0) %>%
+  mutate(industry_pct_fraud = `1`/(`1`+`0`)) %>%
+  select(industry, industry_pct_fraud)
+
+job_training <- job_training %>%
+  left_join(industry_fraud) %>%
+  select(-industry)
+
+job_holdout <- job_holdout %>%
+  left_join(industry_fraud) %>%
+  select(-industry)
+
+remove(industry_fraud)
+
+
+###---
+job_function_fraud <- job_training %>%
+  group_by(fraudulent, job_function) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n, values_fill = 0.0) %>%
+  mutate(jfunction_pct_fraud = `1`/(`0`+`1`)) %>%
+  select(job_function, jfunction_pct_fraud)
+
+job_training <- job_training %>%
+  left_join(job_function_fraud) %>%
+  select(-job_function)
+
+job_holdout <- job_holdout %>%
+  left_join(job_function_fraud) %>%
+  select(-job_function)
+
+remove(job_function_fraud)
+
+```
+
+
+### Add number of words used to describe the company and the job position
+```{r, message=FALSE, warning=FALSE}
+job_training <- job_training %>%
+  mutate(company_profile_words = ifelse(is.na(company_profile), 0, str_count(company_profile, boundary("word"))),description_words = 
+      ifelse(is.na(description), 0, str_count(description, boundary("word"))),
+    requirement_words =
+      ifelse(is.na(requirements), 0, str_count(requirements, boundary("word"))),
+    benefit_words = ifelse(is.na(benefits), 0, str_count(benefits, boundary("word"))))
+
+  
+job_holdout <- job_holdout %>%
+  mutate(company_profile_words = ifelse(is.na(company_profile), 0, str_count(company_profile, boundary("word"))),description_words = 
+      ifelse(is.na(description), 0, str_count(description, boundary("word"))),
+    requirement_words =
+      ifelse(is.na(requirements), 0, str_count(requirements, boundary("word"))),
+    benefit_words = ifelse(is.na(benefits), 0, str_count(benefits, boundary("word"))))
+```
+
+
+### Clean text data
+```{r, message=FALSE, warning=FALSE}
+job_training <- job_training %>%
+  mutate(title = stri_replace_all_regex(title, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(company_profile = stri_replace_all_regex(company_profile, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(description = stri_replace_all_regex(description, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(requirements = stri_replace_all_regex(requirements, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(benefits = stri_replace_all_regex(benefits, '[^a-zA-Z0-9*$]', " "))
+
+job_holdout <- job_holdout %>%
+  mutate(title = stri_replace_all_regex(title, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(company_profile = stri_replace_all_regex(company_profile, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(description = stri_replace_all_regex(description, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(requirements = stri_replace_all_regex(requirements, '[^a-zA-Z0-9*$]', " ")) %>%
+  mutate(benefits = stri_replace_all_regex(benefits, '[^a-zA-Z0-9*$]', " "))
+```
+
+
+### to factor
+```{r, message=FALSE, warning=FALSE}
+training_df <- job_training %>%
+  mutate_if(is.character, as_factor) %>%
+  mutate(fraudulent = as.factor(fraudulent)) %>%
+  mutate(telecommuting = as.factor(telecommuting)) %>%
+  mutate(has_company_logo = as.factor(has_company_logo)) %>%
+  mutate(has_questions = as.factor(has_questions)) %>%
+  mutate(has_salary_range = as.factor(has_salary_range)) %>%
+  mutate(has_department = as.factor(has_department))
+
+holdout_df <- job_holdout %>%
+  mutate_if(is.character, as_factor) %>%
+  mutate(telecommuting = as.factor(telecommuting)) %>%
+  mutate(has_company_logo = as.factor(has_company_logo)) %>%
+  mutate(has_questions = as.factor(has_questions)) %>%
+  mutate(has_salary_range = as.factor(has_salary_range)) %>%
+  mutate(has_department = as.factor(has_department))
+
+```
+
+```{r}
+skimr::skim_without_charts(data=training_df)
+```
+
+## Split Data
+```{r}
+set.seed(42)
+df_split <- initial_split(data = training_df, prop = 0.7, strata = fraudulent)
+
+train <- training(df_split)
+test <- testing(df_split)
+
+set.seed(42)
+train_fold <- vfold_cv(data = train, v = 5)
+```
+
+
+## Data Exploration
+
+### Target Variable - bar graph
+```{r, message=FALSE, warning=FALSE}
+job_training %>%
+  ggplot(aes(fraudulent)) +
+  geom_bar(stat = "count") +
+  labs(title = "Distribution of Fraudulent Jobs")
+```
+
+### Target variable - table
+```{r, message=FALSE, warning=FALSE}
+job_training %>%
+  group_by(fraudulent) %>%
+  summarize(n=n()) %>%
+  mutate(pct = round(n/sum(n), 2))
+```
+
+
+### Correlation
+```{r, message=FALSE, warning=FALSE}
+job_training %>%
+  select(where(is.numeric), -job_id) %>%
+  lares::corr_var(fraudulent)
+```
+
+
+### Numeric Data
+```{r, message=FALSE, warning=FALSE}
+
+plot_numeric <- function(col){
+  training_df %>%
+    ggplot(aes(x=fraudulent, y=!!as.name(col))) +
+    geom_boxplot()
+}
+
+for (column in names(training_df %>% select(where(is.numeric), -job_id))){
+  print(plot_numeric(column))
+}
+  
+
+
+```
+
+#### Numeric Data - Percentage fraud by category
+
+**Industry percentage fraud and job function percentage fraud**
+```{r, message=FALSE, warning=FALSE}
+
+training_df %>%
+  select(fraudulent, where(is.numeric), -job_id) %>%
+  group_by(fraudulent) %>%
+  summarize(industry_pct = round(mean(industry_pct_fraud), 2),
+            job_function_pct = round(mean(jfunction_pct_fraud), 2)) %>%
+  ungroup() %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+**Number of words used to describe company profile, job description**
+**job requirements, and benefits**
+```{r, message=FALSE, warning=FALSE}
+
+training_df %>%
+  select(fraudulent, where(is.numeric), -job_id) %>%
+  group_by(fraudulent) %>%
+  summarize(company_profile = round(mean(company_profile_words), 0),
+            description = round(mean(description_words), 0),
+            requirement = round(mean(requirement_words), 0),
+            benefit = round(mean(benefit_words), 0)) %>%
+  ungroup() %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+### factor Data
+```{r, message=FALSE, warning=FALSE}
+plot_factor <- function(col){
+  training_df %>%
+    ggplot(., aes(!!as.name(col))) +
+    geom_bar(aes(fill = fraudulent), position = "fill") +
+    coord_flip()
+}
+
+for(column in names(training_df %>%
+                    select(telecommuting, has_company_logo, has_questions,
+                           employment_type, required_experience, required_education,
+                           has_salary_range,has_department)))
+{
+  print(plot_factor(column))
+}
+```
+
+#### Factor data - percentage fraud by category
+
+**Telecommuting**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, telecommuting) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(telecommuting, legit, fraud, pct) %>%
+  arrange(desc(pct))
+
+```
+
+**has_company_logo**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, has_company_logo) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(has_company_logo, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+**has_questions**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, has_questions) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(has_questions, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+**employment_type**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, employment_type) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(employment_type, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+**required_experience**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, required_experience) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(required_experience, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+**required_education**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, required_education) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(required_education, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+
+**has_salary_range**
+```{r, message=FALSE, warning=FALSE}
+training_df %>%
+  select(where(is.factor)) %>%
+  group_by(fraudulent, has_salary_range) %>%
+  summarize(n=n()) %>%
+  pivot_wider(names_from = fraudulent, values_from = n) %>%
+  mutate(pct = round(`1`/(`0`+`1`), 2), legit = `0`, fraud = `1`) %>%
+  select(has_salary_range, legit, fraud, pct)%>%
+  arrange(desc(pct))
+
+```
+
+## Model Creation
+
+### Random Forest
+```{r, message=FALSE, warning=FALSE}
+
+training_recipe <- training_df %>%
+  recipe(fraudulent ~.) %>%
+  update_role(job_id, new_role = "IGNORE") %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_tokenize(title, company_profile, description, requirements, benefits) %>%
+  step_stopwords(title, company_profile, description, requirements, benefits) %>%
+  step_tokenfilter(title, company_profile, description, requirements, benefits, max_tokens = 5) %>%
+  step_tf(title, company_profile, description, requirements, benefits) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01)
+
+
+rf_model <- rand_forest(min_n = tune(), trees = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+
+rf_workflow <- workflow() %>%
+  add_recipe(training_recipe) %>%
+  add_model(rf_model)
+
+all_cores <- detectCores(logical = FALSE)
+cl <- makeCluster(all_cores)
+doParallel::registerDoParallel(cl)
+rf_grid <- grid_regular(
+  min_n(),
+  trees(c(5,20)),
+  levels = 5
+)
+
+rf_tuning_results <- rf_workflow %>%
+  tune_grid(
+    resamples = train_fold,
+    grid = rf_grid
+    )
+
+rf_model <- rf_workflow %>%
+  finalize_workflow(select_best(rf_tuning_results))
+
+rf_fit <- fit(rf_model, train)
+```
+
+
+### Tuning Metrics
+
+**Tuning metrics - Table**
+```{r, message=FALSE, warning=FALSE}
+rf_tuning_results_table <- rf_tuning_results %>%
+  collect_metrics()%>%
+  mutate_if(is.numeric, round, 3)%>%
+  select(.metric, trees, min_n, mean, std_err) %>%
+  arrange(desc(mean))
+
+rf_tuning_results_table %>%
+  filter(.metric == "roc_auc")
+```
+
+
+**Tuning metrics - Effect of "trees"**
+```{r, message=FALSE, warning=FALSE}
+rf_tuning_results_table %>%
+  ggplot(aes(trees, mean)) +
+  geom_line() +
+  facet_wrap(~.metric, scales="free", nrow = 2)
+```
+
+**Tuning metrics - Effect of "min_n"**
+```{r, message=FALSE, warning=FALSE}
+rf_tuning_results_table %>%
+  ggplot(aes(min_n, mean)) +
+  geom_line() +
+  facet_wrap(~.metric, scales="free", nrow = 2)
+```
+
+### Fit model metrics
+
+**Fit model metrics - Scores**
+```{r, message=FALSE, warning=FALSE}
+options(yardstick.event_first = FALSE)
+rf_train_scored <- predict(rf_fit, train, type = "prob") %>%
+  bind_cols(predict(rf_fit, train)) %>%
+  bind_cols(train) %>%
+  mutate(model = "random forest", scored_on = "train data") %>%
+  select(job_id, model, scored_on, fraudulent, .pred_class, .pred_1)
+
+rf_test_scored <- predict(rf_fit, test, type = "prob") %>%
+  bind_cols(predict(rf_fit, test)) %>%
+  bind_cols(test) %>%
+  mutate(model = "random forest", scored_on = "test data") %>%
+  select(job_id, model, scored_on, fraudulent, .pred_class, .pred_1)
+
+rf_scored <- rf_train_scored %>%
+  bind_rows(rf_test_scored)
+
+```
+
+
+**Fit model metrics - important variables**
+```{r, message=FALSE, warning=FALSE}
+rf_fit %>%
+  pull_workflow_fit() %>%
+  vip(10)
+```
+
+
+
+**Fit model metrics - Classification Matrix**
+```{r, message=FALSE, warning=FALSE}
+rf_train_scored %>%
+  conf_mat(fraudulent, .pred_class) %>%
+  autoplot(type="heatmap") +
+  labs(title = "Classification Matrix - Train Data")
+```
+```{r, message=FALSE, warning=FALSE}
+rf_test_scored %>%
+  conf_mat(fraudulent, .pred_class) %>%
+  autoplot(type="heatmap") +
+  labs(title = "Classification Matrix - Test Data")
+```
+
+**Fit model metrics - ROC_AUC Curve**
+```{r, message=FALSE, warning=FALSE}
+rf_scored %>%
+  group_by(scored_on) %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.1, color="blue", size=0.5)
+```
+
+**Metrics - accuracy, kap, mn_log_loss and roc_auc**
+```{r, message=FALSE, warning=FALSE}
+rf_metrics_roc_logloss_etc <- rf_test_scored %>%
+  metrics(fraudulent, .pred_1, estimate =.pred_class) %>%
+  mutate(model = "random forest", scored_on = "test data") %>%
+  bind_rows(
+    rf_train_scored %>%
+      metrics(fraudulent, .pred_1, estimate =.pred_class) %>%
+      mutate(model = "random forest", scored_on = "train data")
+  ) %>%
+  group_by(model, scored_on) %>%
+  pivot_wider(names_from = .metric, values_from =  .estimate) %>%
+  select(model, .estimator, scored_on, accuracy, kap, mn_log_loss, roc_auc) %>%
+  mutate_if(is.numeric, round, 2)
+
+rf_metrics_roc_logloss_etc
+
+```
+
+
+**Metrics - precision and recall**
+```{r, message=FALSE, warning=FALSE}
+rf_metrics_precision_and_recall <- rf_train_scored %>%
+  precision(truth = fraudulent, estimate = .pred_class) %>%
+  bind_rows(rf_train_scored %>%
+              recall(truth = fraudulent, estimate = .pred_class)) %>%
+  mutate(model = "random forest", scored_on = "train data") %>%
+  bind_rows(
+    rf_test_scored %>%
+      precision(truth = fraudulent, estimate = .pred_class) %>%
+      bind_rows(rf_test_scored %>%
+                  recall(truth = fraudulent, estimate = .pred_class)) %>%
+      mutate(model = "random forest", scored_on = "test data")  
+  ) %>%
+  group_by(model, scored_on) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(model, .estimator, scored_on, precision, recall) %>%
+  mutate_if(is.numeric, round, 2)
+
+rf_metrics_precision_and_recall
+
+```
+
+
+**Fit model metrics - Threshold**
+```{r, message=FALSE, warning=FALSE}
+rf_test_scored %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  mutate(fpr = 1-round(specificity, 2),
+         tpr = round(sensitivity, 3),
+         threshold = 1 - round(.threshold, 3)) %>%
+  select(fpr, tpr, threshold) %>%
+  group_by(fpr) %>%
+  summarize(tpr = max(tpr),
+          threshold = max(threshold)) %>%
+  ungroup() %>%
+  mutate(precision = tpr/(fpr + tpr)) %>%
+  mutate_if(is.numeric, round, 2) %>%
+  arrange(fpr) %>%
+  filter(fpr <= 0.1)
+
+```
+
+
+
+
+### XGBoost
+```{r, message=FALSE, warning=FALSE}
+xgboost_recipe <- training_df %>%
+  recipe(fraudulent ~.) %>%
+  update_role(job_id, new_role = "IGNORE") %>%
+  step_nzv(all_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_tokenize(title, company_profile, description, requirements, benefits) %>%
+  step_stopwords(title, company_profile, description, requirements, benefits) %>%
+  step_tokenfilter(title, company_profile, description, requirements, benefits, max_tokens = 5) %>%
+  step_tf(title, company_profile, description, requirements, benefits) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+
+xgboost_model <- boost_tree(trees = 5,
+                            tree_depth = tune(),
+                            learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgboost_wf <- workflow() %>%
+  add_recipe(xgboost_recipe) %>%
+  add_model(xgboost_model)
+
+xgboost_grid <- grid_regular(
+  tree_depth(),
+  learn_rate(),
+  levels=5)
+
+all_cores <- detectCores(logical = FALSE)
+cl <- makeCluster(all_cores)
+doParallel::registerDoParallel(cl)
+
+xgboost_tuning_results <- xgboost_wf %>%
+  tune_grid(
+    resamples = train_fold,
+    grid = xgboost_grid
+  )
+
+xgboost_model <- xgboost_wf %>%
+  finalize_workflow(select_best(xgboost_tuning_results))
+
+xgboost_fit <- fit(xgboost_model, train)
+```
+
+**Tuning metrics Scores - Table**
+```{r, message=FALSE, warning=FALSE}
+xgboost_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round, 3) %>%
+  select(.metric, tree_depth, learn_rate, mean, std_err) %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+```
+
+
+**Tuning metrics Scores - Effects of "tree_depth"**
+```{r, message=FALSE, warning=FALSE}
+xgboost_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round, 3) %>%
+  select(.metric, tree_depth, learn_rate, mean, std_err) %>%
+  ggplot(aes(tree_depth, mean)) +
+  geom_line() +
+  facet_wrap(~.metric, scales = "free", nrow = 2)
+```
+
+**Tuning metrics Scores - Effect of "learn_rate"**
+```{r, message=FALSE, warning=FALSE}
+xgboost_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round, 3) %>%
+  select(.metric, tree_depth, learn_rate, mean, std_err) %>%
+  ggplot(aes(learn_rate, mean)) +
+  geom_line() +
+  facet_wrap(~.metric, scales = "free", nrow = 2)
+```
+
+### Fit model metrics
+```{r, message=FALSE, warning=FALSE}
+options(yardstick.event_first = FALSE)
+xgboost_train_scored <- predict(xgboost_fit, train, type = "prob") %>%
+  bind_cols(predict(xgboost_fit, train)) %>%
+  bind_cols(train) %>%
+  mutate(model = "xgboost", scored_on = "train data") %>%
+  select(job_id, model, scored_on, fraudulent, .pred_class, .pred_1)
+
+xgboost_test_scored <- predict(xgboost_fit, test, type = "prob") %>%
+  bind_cols(predict(xgboost_fit, test)) %>%
+  bind_cols(test) %>%
+  mutate(model = "xgboost", scored_on = "test data") %>%
+  select(job_id, model, scored_on, fraudulent, .pred_class, .pred_1)
+
+xgboost_scored <- xgboost_train_scored %>%
+  bind_rows(xgboost_test_scored)
+
+```
+
+
+**Important variables**
+```{r, message=FALSE, warning=FALSE}
+xgboost_fit %>%
+  pull_workflow_fit() %>%
+  vip(10)
+```
+
+
+**Fit model metrics - ROC_AUC Curve**
+```{r, message=FALSE, warning=FALSE}
+xgboost_scored %>%
+  group_by(scored_on) %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.1, color="blue", size=0.5)
+```
+
+**Metrics - accuracy, kap, mn_log_loss and roc_auc**
+```{r, message=FALSE, warning=FALSE}
+xgboost_metrics_roc_logloss_etc <- xgboost_test_scored %>%
+  metrics(fraudulent, .pred_1, estimate =.pred_class) %>%
+  mutate(model = "xgboost", scored_on = "test data") %>%
+  bind_rows(
+    xgboost_train_scored %>%
+      metrics(fraudulent, .pred_1, estimate =.pred_class) %>%
+      mutate(model = "xgboost", scored_on = "train data")
+  ) %>%
+  group_by(model, scored_on) %>%
+  pivot_wider(names_from = .metric, values_from =  .estimate) %>%
+  select(model, .estimator, scored_on, accuracy, kap, mn_log_loss, roc_auc) %>%
+  mutate_if(is.numeric, round, 2)
+
+xgboost_metrics_roc_logloss_etc
+```
+
+
+**Metrics - precision and recall**
+```{r, message=FALSE, warning=FALSE}
+xgboost_metrics_precision_and_recall <- xgboost_train_scored %>%
+  precision(truth = fraudulent, estimate = .pred_class) %>%
+  bind_rows(rf_train_scored %>%
+              recall(truth = fraudulent, estimate = .pred_class)) %>%
+  mutate(model = "xgboost", scored_on = "train data") %>%
+  bind_rows(
+    xgboost_test_scored %>%
+      precision(truth = fraudulent, estimate = .pred_class) %>%
+      bind_rows(rf_test_scored %>%
+                  recall(truth = fraudulent, estimate = .pred_class)) %>%
+      mutate(model = "xgboost", scored_on = "test data")  
+  ) %>%
+  group_by(model, scored_on) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(model, .estimator, scored_on, precision, recall) %>%
+  mutate_if(is.numeric, round, 2)
+
+xgboost_metrics_precision_and_recall
+```
+
+
+**Fit model metrics - threshold**
+```{r, message=FALSE, warning=FALSE}
+rf_test_scored %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  mutate(fpr = 1-round(specificity, 2),
+         tpr = round(sensitivity, 3),
+         threshold = 1 - round(.threshold, 3)) %>%
+  select(fpr, tpr, threshold) %>%
+  group_by(fpr) %>%
+  summarize(tpr = max(tpr),
+          threshold = max(threshold)) %>%
+  ungroup() %>%
+  mutate(precision = round(tpr/(fpr + tpr), 2)) %>%
+  select(fpr, tpr, precision, threshold) %>%
+  arrange(fpr) %>%
+  filter(fpr <= 0.1)
+
+```
+
+
+## Model Comparison
+
+### ROC_AUC curve
+```{r, message=FALSE,warning=FALSE}
+rf_scored %>%
+  bind_rows(xgboost_scored) %>%
+  filter(scored_on == "test data") %>%
+  group_by(model)%>%
+  roc_curve(fraudulent, .pred_1) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.1, color = "blue", size = 0.5)
+
+```
+
+### Metrics
+```{r, message=FALSE, warning=FALSE}
+precision_and_recall <- rf_metrics_precision_and_recall %>%
+  bind_rows(xgboost_metrics_precision_and_recall)
+
+rf_scored %>%
+  bind_rows(xgboost_scored) %>%
+  group_by(model, scored_on) %>%
+  metrics(fraudulent, .pred_1, estimate = .pred_class ) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(model, .estimator, scored_on, accuracy, kap, mn_log_loss, roc_auc) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  left_join(precision_and_recall) %>%
+  select(model, scored_on, accuracy, kap, mn_log_loss, roc_auc, precision, recall)
+
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, results=FALSE}
+rf_predictions <- predict(rf_fit, holdout_df, type = "prob") %>%
+  bind_cols(holdout_df) %>%
+  select(job_id, fraudulent = .pred_1)
+
+write_csv(rf_predictions, "rf.csv")
+
+
+xgboost_predictions <- predict(xgboost_fit, holdout_df, type = "prob") %>%
+  bind_cols(holdout_df) %>%
+  select(job_id, fraudulent = .pred_1)
+
+write_csv(xgboost_predictions, "xgboost.csv")
+```
+
+
+
